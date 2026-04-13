@@ -98,8 +98,6 @@ kernel: page fault trap, code=2
 Stopped at      tcp_sack_option+0x158:  movq    %rcx,0x10(%r13)
 ```
 
-```
-
 ## References
 
 - [OpenBSD 7.8 Errata #025](https://www.openbsd.org/errata78.html)
